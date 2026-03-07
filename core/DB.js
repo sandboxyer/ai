@@ -36,7 +36,8 @@ function getMachineId() {
 }
 
 function generateUniqueId() {
-    return getMachineId();
+    // Always generate a truly unique ID with timestamp + random component
+    return `${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
 }
 
 // ========== Lock Manager ==========
@@ -160,7 +161,8 @@ class MemoryManager extends EventEmitter {
         const key = instance.__storageKey;
         this.instanceAccess.set(key, {
             lastAccess: Date.now(),
-            dirty: instance.__dirty || false
+            dirty: instance.__dirty || false,
+            serialized: instance.__getSerializedState ? instance.__getSerializedState() : {}
         });
     }
 
@@ -730,6 +732,24 @@ function getInheritanceChain(obj) {
     return chain;
 }
 
+// ========== Helper to reconstruct instance with constructor data ==========
+function reconstructInstance(ClassType, id, storage, data) {
+    // Create a new instance WITHOUT calling the constructor with parameters
+    // This is the key fix - we need to create the instance and THEN apply the data
+    const instance = new ClassType({ id, storage });
+    
+    // Apply the loaded data to the instance
+    if (data) {
+        for (const [key, value] of Object.entries(data)) {
+            if (!key.startsWith('__') && typeof value !== 'function') {
+                instance[key] = value;
+            }
+        }
+    }
+    
+    return instance;
+}
+
 // ========== The Enhanced DB Class ==========
 class DB {
     constructor(options = {}) {
@@ -749,18 +769,13 @@ class DB {
         // Track if we've loaded data to prevent overwriting
         this.__loaded = false;
         
-        // Create a unique cache key that includes a timestamp to prevent caching issues
-        // This ensures we always create a new instance for testing
-        if (process.env.NODE_ENV === 'test' || DEBUG) {
-            debugLog('Creating new instance (cache bypassed for testing)');
-            // Don't use cache in test mode
-        } else {
-            // Check cache with full storage key + constructor name
-            const cacheKey = `${this.constructor.name}:${this.__storageKey}`;
-            if (instanceCache.has(cacheKey)) {
-                debugLog(`Returning cached instance for ${cacheKey}`);
-                return instanceCache.get(cacheKey);
-            }
+        // Cache key for this instance
+        const cacheKey = `${this.constructor.name}:${this.__storageKey}`;
+        
+        // Only return cached instance if we're explicitly trying to load an existing instance
+        if (!DEBUG && options.id && instanceCache.has(cacheKey)) {
+            debugLog(`Returning cached instance for ${cacheKey}`);
+            return instanceCache.get(cacheKey);
         }
         
         // Check if we should load from memory manager
@@ -774,23 +789,26 @@ class DB {
             }
         }
         
-        // Load existing data
-        this.__loadSync();
-        
-        // Initialize state
-        this.__dirty = false;
-        
-        // Only cache if not in test mode
-        if (!DEBUG) {
-            const cacheKey = `${this.constructor.name}:${this.__storageKey}`;
-            instanceCache.set(cacheKey, this);
+        // Load existing data - but only if this is NOT a new instance being created
+        // This prevents overwriting constructor-set values
+        if (options.id) {
+            // This is an existing instance being loaded, so load the data
+            this.__loadSync();
+        } else {
+            // This is a new instance, don't load anything, just mark as dirty so it saves
+            this.__dirty = true;
         }
+        
+        // Initialize state if not already set
+        this.__dirty = this.__dirty || false;
+        
+        // Store in cache
+        instanceCache.set(cacheKey, this);
         
         memoryManager.registerAccess(this);
         memoryManager.incrementInstanceCount();
         
-        debugLog(`New instance created with key: ${this.__storageKey}`);
-        debugLog('Loaded data:', this.__getSerializedState());
+        debugLog(`Instance created with key: ${this.__storageKey}`);
         
         // Return auto-save proxy
         return createAutoSaveProxy(this);
@@ -813,24 +831,23 @@ class DB {
                 const deserialized = this.__storage._deserialize(data);
                 debugLog('Deserialized data:', deserialized);
                 
-                // Apply loaded data only if we haven't loaded yet
-                if (!this.__loaded) {
-                    for (const [key, value] of Object.entries(deserialized)) {
-                        if (!key.startsWith('__') && typeof value !== 'function') {
+                // Apply loaded data - but don't overwrite existing properties
+                // This ensures constructor values are preserved
+                for (const [key, value] of Object.entries(deserialized)) {
+                    if (!key.startsWith('__') && typeof value !== 'function') {
+                        // Only set if not already set (preserve constructor values)
+                        if (this[key] === undefined) {
                             this[key] = value;
                         }
                     }
-                    this.__loaded = true;
-                    debugLog('Data loaded successfully');
-                } else {
-                    debugLog('Already loaded, skipping');
                 }
+                this.__loaded = true;
+                debugLog('Data loaded successfully');
             } else {
                 debugLog('File does not exist, starting fresh');
             }
         } catch (err) {
             debugLog('Error loading data:', err.message);
-            // File doesn't exist or error loading - start fresh
         }
     }
 
@@ -956,7 +973,7 @@ class DB {
         return this;
     }
 
-    // Static methods
+    // FIXED: Static methods for retrieving instances
     static async getAll(storage = null) {
         const store = storage || getDefaultStorage();
         const keys = await store.list();
@@ -968,10 +985,32 @@ class DB {
             const classes = classChain.split('.');
             const lastClass = classes[classes.length - 1];
             
+            // Match exact class name
             if (lastClass === className) {
                 const uniqueKey = key.split(':')[1];
-                const instance = new this({ id: uniqueKey, storage: store });
-                instances.push(instance);
+                
+                // Check cache first
+                const cacheKey = `${className}:${key}`;
+                if (instanceCache.has(cacheKey)) {
+                    instances.push(instanceCache.get(cacheKey));
+                } else {
+                    // Load the data first
+                    const data = await store.load(key);
+                    
+                    // Create instance with ID but don't let constructor load data again
+                    const instance = new this({ id: uniqueKey, storage: store });
+                    
+                    // Apply the loaded data (this will preserve constructor values)
+                    if (data) {
+                        for (const [prop, value] of Object.entries(data)) {
+                            if (!prop.startsWith('__') && typeof value !== 'function') {
+                                instance[prop] = value;
+                            }
+                        }
+                    }
+                    
+                    instances.push(instance);
+                }
             }
         }
         
@@ -990,8 +1029,29 @@ class DB {
             
             if (classes.includes(className)) {
                 const uniqueKey = key.split(':')[1];
-                const instance = new this({ id: uniqueKey, storage: store });
-                instances.push(instance);
+                
+                // Check cache first
+                const cacheKey = `${className}:${key}`;
+                if (instanceCache.has(cacheKey)) {
+                    instances.push(instanceCache.get(cacheKey));
+                } else {
+                    // Load the data first
+                    const data = await store.load(key);
+                    
+                    // Create instance with ID
+                    const instance = new this({ id: uniqueKey, storage: store });
+                    
+                    // Apply the loaded data
+                    if (data) {
+                        for (const [prop, value] of Object.entries(data)) {
+                            if (!prop.startsWith('__') && typeof value !== 'function') {
+                                instance[prop] = value;
+                            }
+                        }
+                    }
+                    
+                    instances.push(instance);
+                }
             }
         }
         
@@ -1001,11 +1061,36 @@ class DB {
     static async findBy(uniqueKey, storage = null) {
         const store = storage || getDefaultStorage();
         const keys = await store.list();
-        const matchingKey = keys.find(k => k.endsWith(`:${uniqueKey}`));
+        const className = this.name;
         
-        if (matchingKey) {
-            const instance = new this({ id: uniqueKey, storage: store });
-            return instance;
+        for (const key of keys) {
+            const keyParts = key.split(':');
+            const keyUniquePart = keyParts[keyParts.length - 1];
+            
+            if (keyUniquePart === uniqueKey) {
+                // Check cache first
+                const cacheKey = `${className}:${key}`;
+                if (instanceCache.has(cacheKey)) {
+                    return instanceCache.get(cacheKey);
+                }
+                
+                // Load the data first
+                const data = await store.load(key);
+                
+                // Create instance with ID
+                const instance = new this({ id: uniqueKey, storage: store });
+                
+                // Apply the loaded data
+                if (data) {
+                    for (const [prop, value] of Object.entries(data)) {
+                        if (!prop.startsWith('__') && typeof value !== 'function') {
+                            instance[prop] = value;
+                        }
+                    }
+                }
+                
+                return instance;
+            }
         }
         return null;
     }
