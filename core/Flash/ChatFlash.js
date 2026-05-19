@@ -16,9 +16,29 @@ let ai
 let process_name
 let port
 
+async function silentPM2Delete(processName) {
+    if (!processName) return
+    
+    const originalWrite = process.stdout.write
+    const originalErrWrite = process.stderr.write
+    
+    process.stdout.write = () => true
+    process.stderr.write = () => true
+    
+    try {
+        await PM2.Delete(processName)
+    } catch (error) {
+        // Silently ignore deletion errors
+    } finally {
+        process.stdout.write = originalWrite
+        process.stderr.write = originalErrWrite
+        console.clear()
+    }
+}
+
 process.on('exit', async () => {
     if (process_name) {
-        await PM2.Delete(process_name)
+        await silentPM2Delete(process_name)
     }
 })
 
@@ -104,10 +124,11 @@ const StartChat = (ai, process_name) => {
         onExit: async (instance) => {
             instance.cleanup()
             if (process_name) {
-                await PM2.Delete(process_name)
+                await silentPM2Delete(process_name)
             }
             console.clear()
             process.exit(0)
+            console.clear()
         },
         title: 'EasyAI'
     })
