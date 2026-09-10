@@ -21,3 +21,5 @@ logs
 *.part
 *.tmp
 buildsaves.cfg
+struct
+result
