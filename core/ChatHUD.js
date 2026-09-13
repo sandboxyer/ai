@@ -23,6 +23,18 @@ import EventEmitter from 'events';
  *   Ctrl+C ............ quit
  *   Ctrl+D ............ quit if input is empty
  *
+ * History / scrollback mode:
+ *   Ctrl+O ............ toggle history mode  (or scroll mouse wheel up)
+ *   ↑ / k ............. previous message
+ *   ↓ / j ............. next message
+ *   PgUp / PgDn ....... jump 5 messages
+ *   Home / g .......... first message
+ *   End  / G .......... last message
+ *   Enter / y / c ..... copy selected message to clipboard (OSC 52)
+ *   Esc / q ........... exit history mode
+ *   Mouse wheel ....... navigate messages
+ *   Left click ........ select a message
+ *
  * The input box starts at exactly 1 row and grows only as needed.
  * The outer frame is rigid and self-healing.
  *
@@ -40,6 +52,7 @@ class ChatHUD extends EventEmitter {
       messageProcessor: null,
       colors: {
         border: '\x1b[38;5;39m',
+        borderHistory: '\x1b[38;5;214m',
         title: '\x1b[1;38;5;220m',
         user: '\x1b[32m',
         userText: '\x1b[37m',
@@ -50,7 +63,8 @@ class ChatHUD extends EventEmitter {
         timestamp: '\x1b[90m',
         prompt: '\x1b[38;5;220m',
         cursor: '\x1b[48;5;220;30m',
-        botIndicator: '\x1b[3;90m'
+        botIndicator: '\x1b[3;90m',
+        selectedBg: '\x1b[48;5;238m'
       },
       messages: {
         welcome: '🚀 Welcome to Terminal Chat!',
@@ -62,6 +76,7 @@ class ChatHUD extends EventEmitter {
       onExit: null,
       inputMinRows: 1,
       inputMaxRows: 10,
+      enableMouse: true,
       ...config
     };
 
@@ -83,6 +98,17 @@ class ChatHUD extends EventEmitter {
     this.width  = Math.max(20, process.stdout.columns || 80);
     this.height = Math.max(8,  process.stdout.rows    || 24);
 
+    // ── history / scrollback state ──────────────────────────────────────
+    this.historyMode       = false;
+    this.selectedMessageIdx = -1;
+    this.messageScrollOffset = 0;   // lines above bottom
+    this._needsScrollToSelection = false;
+    this._messageRowRanges = [];    // [{ msgIdx, startRow, endRow }]
+    this._lastDisplayLineCount = 0;
+    this._flashText = null;
+    this._flashUntil = 0;
+    this._flashTimer = null;
+
     this._blinkOn = true;
     this._blinkTimer = null;
     this._healTimer = null;
@@ -97,6 +123,14 @@ class ChatHUD extends EventEmitter {
       process.stdout.write('\x1b[>4;2m');   // modifyOtherKeys = 2
       process.stdout.write('\x1b[>4;1m');   // modifyOtherKeys = 1
     } catch (_) { /* not a TTY, ignore */ }
+
+    // Enable SGR mouse tracking (wheel + clicks) — used for scrollback.
+    if (this.config.enableMouse) {
+      try {
+        process.stdout.write('\x1b[?1000h');  // normal tracking
+        process.stdout.write('\x1b[?1006h');  // SGR extended encoding
+      } catch (_) { /* ignore */ }
+    }
 
     // Raw stdin only — no readline.
     if (process.stdin.isTTY) process.stdin.setRawMode(true);
@@ -205,6 +239,10 @@ class ChatHUD extends EventEmitter {
 
   /* ──────────────────────────────── frame ───────────────────────────── */
 
+  activeBorderColor() {
+    return this.historyMode ? this.config.colors.borderHistory : this.config.colors.border;
+  }
+
   drawFullInterface() {
     this.refreshDimensions();
     process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
@@ -212,33 +250,34 @@ class ChatHUD extends EventEmitter {
 
     const W = this.width;
     const C = this.config.colors;
+    const B = this.activeBorderColor();
 
-    process.stdout.write(`${C.border}┌${'─'.repeat(W - 2)}┐\x1b[0m`);
+    process.stdout.write(`${B}┌${'─'.repeat(W - 2)}┐\x1b[0m`);
 
     let title = ` ${this.config.title} `;
     if (title.length > W - 2) title = title.slice(0, W - 3) + ' ';
     const padding  = W - title.length - 2;
     const leftPad  = Math.max(0, Math.floor(padding / 2));
     const rightPad = Math.max(0, padding - leftPad);
-    process.stdout.write(`\x1b[2;1H${C.border}│\x1b[0m${' '.repeat(leftPad)}${C.title}${title}\x1b[0m${' '.repeat(rightPad)}${C.border}│\x1b[0m`);
+    process.stdout.write(`\x1b[2;1H${B}│\x1b[0m${' '.repeat(leftPad)}${C.title}${title}\x1b[0m${' '.repeat(rightPad)}${B}│\x1b[0m`);
 
-    process.stdout.write(`\x1b[3;1H${C.border}├${'─'.repeat(W - 2)}┤\x1b[0m`);
+    process.stdout.write(`\x1b[3;1H${B}├${'─'.repeat(W - 2)}┤\x1b[0m`);
 
     const { layout, inputTop, inputBottom, separatorRow } = this.frameRows();
     const messageEnd = separatorRow - 1;
 
     for (let i = 4; i <= messageEnd; i++) {
-      process.stdout.write(`\x1b[${i};1H${C.border}│\x1b[0m\x1b[K\x1b[${i};${W}H${C.border}│\x1b[0m`);
+      process.stdout.write(`\x1b[${i};1H${B}│\x1b[0m\x1b[K\x1b[${i};${W}H${B}│\x1b[0m`);
     }
 
-    process.stdout.write(`\x1b[${separatorRow};1H${C.border}├${'─'.repeat(W - 2)}┤\x1b[0m`);
+    this.redrawSeparator();
 
     for (let i = 0; i < layout.rows; i++) {
       const row = inputTop + i;
-      process.stdout.write(`\x1b[${row};1H${C.border}│\x1b[0m\x1b[K\x1b[${row};${W}H${C.border}│\x1b[0m`);
+      process.stdout.write(`\x1b[${row};1H${B}│\x1b[0m\x1b[K\x1b[${row};${W}H${B}│\x1b[0m`);
     }
 
-    process.stdout.write(`\x1b[${inputBottom};1H${C.border}└${'─'.repeat(W - 2)}┘\x1b[0m`);
+    process.stdout.write(`\x1b[${inputBottom};1H${B}└${'─'.repeat(W - 2)}┘\x1b[0m`);
 
     this._lastRows = layout.rows;
     this.redrawMessages();
@@ -249,37 +288,187 @@ class ChatHUD extends EventEmitter {
     this.refreshDimensions();
     const W = this.width;
     const C = this.config.colors;
+    const B = this.activeBorderColor();
 
-    process.stdout.write(`\x1b[1;1H${C.border}┌${'─'.repeat(W - 2)}┐\x1b[0m`);
+    process.stdout.write(`\x1b[1;1H${B}┌${'─'.repeat(W - 2)}┐\x1b[0m`);
 
     let title = ` ${this.config.title} `;
     if (title.length > W - 2) title = title.slice(0, W - 3) + ' ';
     const padding  = Math.max(0, W - title.length - 2);
     const leftPad  = Math.floor(padding / 2);
     const rightPad = padding - leftPad;
-    process.stdout.write(`\x1b[2;1H${C.border}│\x1b[0m${' '.repeat(leftPad)}${C.title}${title}\x1b[0m${' '.repeat(rightPad)}${C.border}│\x1b[0m`);
+    process.stdout.write(`\x1b[2;1H${B}│\x1b[0m${' '.repeat(leftPad)}${C.title}${title}\x1b[0m${' '.repeat(rightPad)}${B}│\x1b[0m`);
 
-    process.stdout.write(`\x1b[3;1H${C.border}├${'─'.repeat(W - 2)}┤\x1b[0m`);
+    process.stdout.write(`\x1b[3;1H${B}├${'─'.repeat(W - 2)}┤\x1b[0m`);
 
     const { layout, inputTop, inputBottom, separatorRow } = this.frameRows();
 
-    process.stdout.write(`\x1b[${separatorRow};1H${C.border}├${'─'.repeat(W - 2)}┤\x1b[0m`);
-    process.stdout.write(`\x1b[${inputBottom};1H${C.border}└${'─'.repeat(W - 2)}┘\x1b[0m`);
+    this.redrawSeparator();
+    process.stdout.write(`\x1b[${inputBottom};1H${B}└${'─'.repeat(W - 2)}┘\x1b[0m`);
 
     for (let i = 4; i <= separatorRow - 1; i++) {
-      process.stdout.write(`\x1b[${i};1H${C.border}│\x1b[0m`);
-      process.stdout.write(`\x1b[${i};${W}H${C.border}│\x1b[0m`);
+      process.stdout.write(`\x1b[${i};1H${B}│\x1b[0m`);
+      process.stdout.write(`\x1b[${i};${W}H${B}│\x1b[0m`);
     }
     for (let i = 0; i < layout.rows; i++) {
       const row = inputTop + i;
-      process.stdout.write(`\x1b[${row};1H${C.border}│\x1b[0m`);
-      process.stdout.write(`\x1b[${row};${W}H${C.border}│\x1b[0m`);
+      process.stdout.write(`\x1b[${row};1H${B}│\x1b[0m`);
+      process.stdout.write(`\x1b[${row};${W}H${B}│\x1b[0m`);
     }
+  }
+
+  redrawSeparator() {
+    const { separatorRow } = this.frameRows();
+    const W = this.width;
+    const C = this.config.colors;
+    const B = this.activeBorderColor();
+
+    if (this._flashText && Date.now() < this._flashUntil) {
+      let txt = ` ${this._flashText} `;
+      if (txt.length > W - 4) txt = txt.slice(0, W - 5) + ' ';
+      const leftDash  = Math.max(0, Math.floor((W - 2 - txt.length) / 2));
+      const rightDash = Math.max(0, W - 2 - txt.length - leftDash);
+      process.stdout.write(`\x1b[${separatorRow};1H${B}├${'─'.repeat(leftDash)}${C.title}${txt}${B}${'─'.repeat(rightDash)}┤\x1b[0m`);
+      return;
+    }
+
+    if (this.historyMode) {
+      let hint = ' HISTORY · ↑↓ navigate · Enter copy · Esc exit ';
+      if (hint.length > W - 4) hint = ' HISTORY · ↑↓ · Enter · Esc ';
+      if (hint.length > W - 4) hint = ' HISTORY ';
+      const leftDash  = Math.max(0, Math.floor((W - 2 - hint.length) / 2));
+      const rightDash = Math.max(0, W - 2 - hint.length - leftDash);
+      process.stdout.write(`\x1b[${separatorRow};1H${B}├${'─'.repeat(leftDash)}${C.title}${hint}${B}${'─'.repeat(rightDash)}┤\x1b[0m`);
+      return;
+    }
+
+    process.stdout.write(`\x1b[${separatorRow};1H${B}├${'─'.repeat(W - 2)}┤\x1b[0m`);
   }
 
   setTitle(newTitle) {
     this.config.title = newTitle;
     this.drawFullInterface();
+  }
+
+  /* ──────────────────────── history / scrollback ────────────────────── */
+
+  toggleHistoryMode() {
+    if (this.historyMode) this.exitHistoryMode();
+    else                  this.enterHistoryMode();
+  }
+
+  enterHistoryMode() {
+    if (this.historyMode) return;
+    this.historyMode = true;
+    this.selectedMessageIdx = Math.max(0, this.messages.length - 1);
+    this._needsScrollToSelection = true;
+    this.drawFullInterface();
+  }
+
+  exitHistoryMode() {
+    if (!this.historyMode) return;
+    this.historyMode = false;
+    this.selectedMessageIdx = -1;
+    this.messageScrollOffset = 0;
+    this._needsScrollToSelection = false;
+    this._messageRowRanges = [];
+    this.drawFullInterface();
+  }
+
+  selectPrevMessage(n = 1) {
+    if (this.messages.length === 0) return;
+    const cur = this.selectedMessageIdx < 0 ? this.messages.length - 1 : this.selectedMessageIdx;
+    this.selectedMessageIdx = Math.max(0, cur - n);
+    this._needsScrollToSelection = true;
+    this.redrawMessages();
+  }
+
+  selectNextMessage(n = 1) {
+    if (this.messages.length === 0) return;
+    const cur = this.selectedMessageIdx < 0 ? this.messages.length - 1 : this.selectedMessageIdx;
+    this.selectedMessageIdx = Math.min(this.messages.length - 1, cur + n);
+    this._needsScrollToSelection = true;
+    this.redrawMessages();
+  }
+
+  selectFirstMessage() {
+    if (this.messages.length === 0) return;
+    this.selectedMessageIdx = 0;
+    this._needsScrollToSelection = true;
+    this.redrawMessages();
+  }
+
+  selectLastMessage() {
+    if (this.messages.length === 0) return;
+    this.selectedMessageIdx = this.messages.length - 1;
+    this._needsScrollToSelection = true;
+    this.redrawMessages();
+  }
+
+  copySelectedMessage() {
+    if (this.selectedMessageIdx < 0 || this.selectedMessageIdx >= this.messages.length) return;
+    const msg = this.messages[this.selectedMessageIdx];
+    if (!msg) return;
+    this.copyToClipboard(msg.text || '');
+    this.setFlash('✓ Copied to clipboard');
+  }
+
+  copyToClipboard(text) {
+    try {
+      const b64 = Buffer.from(text, 'utf8').toString('base64');
+      // OSC 52 — works in iTerm2, kitty, WezTerm, Ghostty, foot,
+      // Windows Terminal, Alacritty, tmux (with set-clipboard on)…
+      process.stdout.write(`\x1b]52;c;${b64}\x07`);
+    } catch (_) { /* ignore */ }
+  }
+
+  setFlash(text, ms = 1500) {
+    this._flashText  = text;
+    this._flashUntil = Date.now() + ms;
+    if (this._flashTimer) clearTimeout(this._flashTimer);
+    this._flashTimer = setTimeout(() => {
+      this._flashText = null;
+      this.redrawSeparator();
+    }, ms);
+    this.redrawSeparator();
+  }
+
+  handleMouseEvent(btn, x, y, code) {
+    const isWheel = (btn & 64) === 64;
+    const dir     = btn & 3;
+
+    if (isWheel) {
+      if (dir === 0) {                       // wheel up
+        if (!this.historyMode) {
+          this.enterHistoryMode();
+          // enterHistoryMode selects last; also step up one so the wheel
+          // feels like it actually moved.
+          this.selectPrevMessage();
+        } else {
+          this.selectPrevMessage();
+        }
+      } else if (dir === 1) {                // wheel down
+        if (this.historyMode) this.selectNextMessage();
+      }
+      return;
+    }
+
+    // Left click selects a message (only meaningful in history mode).
+    if (code === 'M' && (btn & 3) === 0 && this.historyMode) {
+      for (const range of this._messageRowRanges) {
+        if (y >= range.startRow && y <= range.endRow) {
+          if (this.selectedMessageIdx !== range.msgIdx) {
+            this.selectedMessageIdx = range.msgIdx;
+            this.redrawMessages();
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  handleStandaloneEscape() {
+    if (this.historyMode) this.exitHistoryMode();
   }
 
   /* ─────────────────────────── input handling ───────────────────────── */
@@ -288,14 +477,18 @@ class ChatHUD extends EventEmitter {
     let escapeBuffer = '';
     let escapeTimer  = null;
 
-    const resetEscape = () => {
+    const resetEscape = (isTimeout = false) => {
+      const wasEsc = escapeBuffer === '\x1b';
       escapeBuffer = '';
       if (escapeTimer) { clearTimeout(escapeTimer); escapeTimer = null; }
+      if (isTimeout && wasEsc) {
+        this.handleStandaloneEscape();
+      }
     };
 
     const isCompleteEscape = (buf) => {
       if (/^\x1bO[A-Za-z]$/.test(buf)) return true;
-      if (/^\x1b\[[0-9;?]*[ -/]*[@-~]$/.test(buf)) return true;
+      if (/^\x1b\[[0-9;?<=>]*[ -/]*[@-~]$/.test(buf)) return true;
       return false;
     };
 
@@ -314,18 +507,18 @@ class ChatHUD extends EventEmitter {
           const seq = escapeBuffer;
           resetEscape();
           this.handleEscapeSequence(seq);
-        } else if (escapeBuffer.length > 16) {
+        } else if (escapeBuffer.length > 24) {
           resetEscape();
         } else {
           if (escapeTimer) clearTimeout(escapeTimer);
-          escapeTimer = setTimeout(resetEscape, 120);
+          escapeTimer = setTimeout(() => resetEscape(true), 120);
         }
         return;
       }
 
       if (data === '\u001b') {
         escapeBuffer = data;
-        escapeTimer = setTimeout(resetEscape, 120);
+        escapeTimer = setTimeout(() => resetEscape(true), 120);
         return;
       }
 
@@ -333,19 +526,20 @@ class ChatHUD extends EventEmitter {
         let rest = data;
         while (rest.length) {
           if (rest[0] === '\u001b') {
-            const m = rest.match(/^\x1bO[A-Za-z]|^\x1b\[[0-9;?]*[ -/]*[@-~]/);
+            const m = rest.match(/^\x1bO[A-Za-z]|^\x1b\[[0-9;?<=>]*[ -/]*[@-~]/);
             if (m) {
               this.handleEscapeSequence(m[0]);
               rest = rest.slice(m[0].length);
               continue;
             }
             escapeBuffer = rest;
-            escapeTimer = setTimeout(resetEscape, 120);
+            escapeTimer = setTimeout(() => resetEscape(true), 120);
             return;
           }
           const nextEsc = rest.indexOf('\u001b');
           const textPart = nextEsc === -1 ? rest : rest.slice(0, nextEsc);
           if (textPart.length) {
+            if (this.historyMode) this.exitHistoryMode();
             const cleaned = this.sanitizePastedText(textPart);
             if (cleaned.length) this.insertText(cleaned);
           }
@@ -356,7 +550,39 @@ class ChatHUD extends EventEmitter {
 
       const code = data.charCodeAt(0);
 
-      // Enter / LF
+      // ── Global toggle: Ctrl+O ────────────────────────────────────────
+      if (code === 15) { this.toggleHistoryMode(); return; }
+
+      // ── History mode key dispatch ────────────────────────────────────
+      if (this.historyMode) {
+        if (code === 13) { this.copySelectedMessage(); return; } // Enter
+        if (code === 15) { this.exitHistoryMode();      return; } // Ctrl+O
+        if (code === 4)  { this.exitHistoryMode();      return; } // Ctrl+D
+        if (code === 113 || code === 81) { this.exitHistoryMode(); return; } // q / Q
+        if (code === 121 || code === 99) { this.copySelectedMessage(); return; } // y / c
+        if (code === 106) { this.selectNextMessage(); return; } // j
+        if (code === 107) { this.selectPrevMessage(); return; } // k
+        if (code === 103) { this.selectFirstMessage(); return; } // g
+        if (code === 71)  { this.selectLastMessage();  return; } // G
+
+        // Backspace / Delete in history mode → exit and process normally
+        if (code === 8 || code === 127) {
+          this.exitHistoryMode();
+          this.handleBackspace();
+          return;
+        }
+
+        // Any other printable character: exit history mode and fall
+        // through so the user can start typing where they left off.
+        if (code >= 32) {
+          this.exitHistoryMode();
+          // fall through to the normal dispatch below
+        } else {
+          return; // ignore other control chars in history mode
+        }
+      }
+
+      // ── Normal mode dispatch (identical to before) ───────────────────
       if (code === 13) { this.handleEnter(); return; }   // CR → submit
       if (code === 10) { this.insertNewline(); return; } // LF → newline
 
@@ -380,9 +606,37 @@ class ChatHUD extends EventEmitter {
   }
 
   handleEscapeSequence(seq) {
+    // ── SGR mouse event ──────────────────────────────────────────────
+    const mMouse = seq.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/);
+    if (mMouse) {
+      this.handleMouseEvent(
+        parseInt(mMouse[1], 10),
+        parseInt(mMouse[2], 10),
+        parseInt(mMouse[3], 10),
+        mMouse[4]
+      );
+      return;
+    }
+
+    // ── History mode: navigation keys ────────────────────────────────
+    if (this.historyMode) {
+      if (seq === '\x1b[A' || seq === '\x1bOA') { this.selectPrevMessage(); return; }
+      if (seq === '\x1b[B' || seq === '\x1bOB') { this.selectNextMessage(); return; }
+      if (seq === '\x1b[5~') { this.selectPrevMessage(5); return; } // PgUp
+      if (seq === '\x1b[6~') { this.selectNextMessage(5); return; } // PgDn
+      if (seq === '\x1b[H'  || seq === '\x1bOH' || seq === '\x1b[1~' || seq === '\x1b[7~') {
+        this.selectFirstMessage(); return;
+      }
+      if (seq === '\x1b[F'  || seq === '\x1bOF' || seq === '\x1b[4~' || seq === '\x1b[8~') {
+        this.selectLastMessage(); return;
+      }
+      if (seq === '\x1b[1;5A') { this.selectFirstMessage(); return; }
+      if (seq === '\x1b[1;5B') { this.selectLastMessage();  return; }
+      // Ignore everything else while browsing history.
+      return;
+    }
+
     // ── CSI-u (kitty / foot / wezterm / Ghostty / Alacritty ≥0.13) ────
-    // Format: ESC [ <code> ; <mod> u    (mod: 1 none, 2 Shift, 3 Alt,
-    //                                    5 Ctrl, 9 Cmd, sums for combos)
     let m = seq.match(/^\x1b\[(\d+);(\d+)u$/);
     if (m) {
       const code = parseInt(m[1], 10);
@@ -452,9 +706,6 @@ class ChatHUD extends EventEmitter {
     if (s === '\x1b\r' || s === '\x1b\x0a') { this.insertNewline(); return; }
 
     // Shift+Enter variants that arrive as standalone escapes
-    //   \x1b[13;2u  (CSI-u)              — handled above
-    //   \x1b[27;2;13~ (modifyOtherKeys)  — handled above
-    //   \x1b\x1b[13;2u (double ESC prefix from some SSH relays)
     if (s === '\x1b\x1b[13;2u' || s === '\x1b\x1b[27;2;13~') {
       this.insertNewline();
       return;
@@ -466,7 +717,7 @@ class ChatHUD extends EventEmitter {
       .replace(/\r\n/g, '\n')
       .replace(/\r/g, '\n')
       .replace(/\t/g, '    ')
-      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+      .replace(/\x1b\[[0-9;?<=>]*[ -/]*[@-~]/g, '')
       .replace(/\x1bO[A-Za-z]/g, '')
       .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
   }
@@ -858,6 +1109,7 @@ class ChatHUD extends EventEmitter {
     this.refreshDimensions();
     const W = this.width;
     const C = this.config.colors;
+    const B = this.activeBorderColor();
 
     const { separatorRow } = this.frameRows();
     const messageStartLine = 4;
@@ -865,9 +1117,12 @@ class ChatHUD extends EventEmitter {
     const messageLines     = Math.max(0, messageEndLine - messageStartLine + 1);
 
     const displayLines = [];
+    const msgRanges    = [];  // per-message [startIdx, endIdx] into displayLines
 
-    for (const msg of this.messages) {
+    for (let mi = 0; mi < this.messages.length; mi++) {
+      const msg = this.messages[mi];
       const msgLines = msg.lines || msg.text.split('\n');
+      const isSelected = this.historyMode && mi === this.selectedMessageIdx;
 
       const labelColor = msg.labelColor ||
         (msg.sender === 'Bot' ? C.bot :
@@ -882,6 +1137,8 @@ class ChatHUD extends EventEmitter {
       const continuationIndent = ' '.repeat(prefixLength - 1);
       const continuationAvailable = Math.max(1, W - continuationIndent.length - 4);
 
+      const startIdx = displayLines.length;
+
       for (let j = 0; j < msgLines.length; j++) {
         const line = msgLines[j];
         if (j === 0) {
@@ -889,35 +1146,86 @@ class ChatHUD extends EventEmitter {
           const wrapped = this.wrapText(line, firstLineAvailable);
           for (let k = 0; k < wrapped.length; k++) {
             displayLines.push(k === 0
-              ? { prefix: coloredPrefix, text: wrapped[k], textColor }
-              : { prefix: continuationIndent, text: wrapped[k], textColor });
+              ? { prefix: coloredPrefix, text: wrapped[k], textColor, selected: isSelected }
+              : { prefix: continuationIndent, text: wrapped[k], textColor, selected: isSelected });
           }
         } else {
           const wrapped = this.wrapText(line, continuationAvailable);
           for (const w of wrapped) {
-            displayLines.push({ prefix: continuationIndent, text: w, textColor });
+            displayLines.push({ prefix: continuationIndent, text: w, textColor, selected: isSelected });
           }
         }
       }
+
+      msgRanges.push({ msgIdx: mi, startIdx, endIdx: displayLines.length - 1 });
     }
 
-    const startIndex = Math.max(0, displayLines.length - messageLines);
+    // ── keep view stable when new lines stream in ────────────────────
+    const newLen = displayLines.length;
+    const prevLen = this._lastDisplayLineCount;
+    if (this.messageScrollOffset > 0 && prevLen > 0 && newLen > prevLen) {
+      this.messageScrollOffset += (newLen - prevLen);
+    }
+    this._lastDisplayLineCount = newLen;
+
+    const maxScroll = Math.max(0, newLen - messageLines);
+
+    // ── scroll to the selected message if we were asked to ───────────
+    if (this._needsScrollToSelection && this.historyMode &&
+        this.selectedMessageIdx >= 0 && this.selectedMessageIdx < msgRanges.length &&
+        messageLines > 0) {
+      const range = msgRanges[this.selectedMessageIdx];
+      const targetTop = Math.max(0, Math.min(range.startIdx, maxScroll));
+      // Only scroll if the selected message is not fully visible.
+      const curStart = newLen - messageLines - this.messageScrollOffset;
+      const curEnd   = curStart + messageLines - 1;
+      if (range.startIdx < curStart || range.endIdx > curEnd) {
+        this.messageScrollOffset = newLen - messageLines - targetTop;
+      }
+      this._needsScrollToSelection = false;
+    }
+
+    this.messageScrollOffset = Math.max(0, Math.min(this.messageScrollOffset, maxScroll));
+
+    const startIndex = Math.max(0, newLen - messageLines - this.messageScrollOffset);
+
+    // ── screen-row map for mouse-click hit testing ───────────────────
+    this._messageRowRanges = [];
+    for (const r of msgRanges) {
+      const screenStart = messageStartLine + (r.startIdx - startIndex);
+      const screenEnd   = messageStartLine + (r.endIdx   - startIndex);
+      if (screenEnd < messageStartLine || screenStart > messageEndLine) continue;
+      this._messageRowRanges.push({
+        msgIdx:   r.msgIdx,
+        startRow: Math.max(screenStart, messageStartLine),
+        endRow:   Math.min(screenEnd,   messageEndLine)
+      });
+    }
+
+    const SELECTED_BG = C.selectedBg || '\x1b[48;5;238m';
+    const RESET_BG    = '\x1b[49m';
 
     for (let i = 0; i < messageLines; i++) {
       const row = messageStartLine + i;
-      process.stdout.write(`\x1b[${row};1H${C.border}│\x1b[0m`);
+      process.stdout.write(`\x1b[${row};1H${B}│\x1b[0m`);
       if (startIndex + i < displayLines.length) {
         const dl = displayLines[startIndex + i];
+        if (dl.selected) process.stdout.write(SELECTED_BG);
         process.stdout.write(dl.prefix);
-        process.stdout.write(`${dl.textColor || ''}${dl.text}\x1b[0m`);
+        if (dl.selected) process.stdout.write(SELECTED_BG);
+        process.stdout.write(`${dl.textColor || ''}`);
+        if (dl.selected) process.stdout.write(SELECTED_BG);
+        process.stdout.write(dl.text);
+        process.stdout.write('\x1b[0m');
+        if (dl.selected) process.stdout.write(RESET_BG);
       }
       process.stdout.write('\x1b[0m\x1b[K');
-      process.stdout.write(`\x1b[${row};${W}H${C.border}│\x1b[0m`);
+      process.stdout.write(`\x1b[${row};${W}H${B}│\x1b[0m`);
     }
   }
 
   stripAnsi(str) {
-    return str.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '');
+    return str.replace(/\x1b\[[0-9;?<=>]*[ -/]*[@-~]/g, '');
   }
 
   wrapText(text, maxWidth) {
@@ -950,6 +1258,7 @@ class ChatHUD extends EventEmitter {
     this.refreshDimensions();
     const W = this.width;
     const C = this.config.colors;
+    const B = this.activeBorderColor();
 
     const { layout, inputTop } = this.frameRows();
     const { textWidth, visualLines, rows, scrollTop, caretVisual } = layout;
@@ -966,14 +1275,14 @@ class ChatHUD extends EventEmitter {
       const row = inputTop + i;
       const vl  = visible[i];
 
-      process.stdout.write(`\x1b[${row};1H${C.border}│\x1b[0m`);
+      process.stdout.write(`\x1b[${row};1H${B}│\x1b[0m`);
 
       if (i === 0) process.stdout.write(` ${C.prompt}➤\x1b[0m `);
       else         process.stdout.write('   ');
 
       if (!vl) {
         process.stdout.write('\x1b[0m\x1b[K');
-        process.stdout.write(`\x1b[${row};${W}H${C.border}│\x1b[0m`);
+        process.stdout.write(`\x1b[${row};${W}H${B}│\x1b[0m`);
         continue;
       }
 
@@ -1003,7 +1312,7 @@ class ChatHUD extends EventEmitter {
         }
       }
 
-      process.stdout.write(`\x1b[${row};${W}H${C.border}│\x1b[0m`);
+      process.stdout.write(`\x1b[${row};${W}H${B}│\x1b[0m`);
     }
 
     const caretRowOnScreen = inputTop + (caretVisual - scrollTop);
@@ -1016,8 +1325,13 @@ class ChatHUD extends EventEmitter {
   cleanup() {
     if (this._blinkTimer) { clearInterval(this._blinkTimer); this._blinkTimer = null; }
     if (this._healTimer)  { clearInterval(this._healTimer);  this._healTimer  = null; }
+    if (this._flashTimer) { clearTimeout(this._flashTimer);  this._flashTimer = null; }
 
     try {
+      if (this.config.enableMouse) {
+        process.stdout.write('\x1b[?1006l');  // disable SGR mouse
+        process.stdout.write('\x1b[?1000l');  // disable normal tracking
+      }
       process.stdout.write('\x1b[<u');      // pop kitty keyboard mode
       process.stdout.write('\x1b[>4;0m');   // disable modifyOtherKeys
       process.stdout.write('\x1b[2J\x1b[3J\x1b[0;0H');
@@ -1103,6 +1417,8 @@ process.on('SIGINT', () => {
     activeChatInstance = null;
   } else {
     try {
+      process.stdout.write('\x1b[?1006l');
+      process.stdout.write('\x1b[?1000l');
       process.stdout.write('\x1b[<u');
       process.stdout.write('\x1b[>4;0m');
       process.stdout.write('\x1b[2J\x1b[3J\x1b[0;0H');
